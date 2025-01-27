@@ -6,9 +6,17 @@ from typing import List
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
+from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
 from safetensors.torch import load_model
 
 from model import Transformer, ModelArgs
+from utils import get_device_initial
+
+import importlib.util
+
+if importlib.util.find_spec("habana_frameworks") is not None:
+    import habana_frameworks.torch.core as htcore
+    import habana_frameworks.torch.hpu as torch_hpu
 
 
 def sample(logits, temperature: float = 1.0):
@@ -33,7 +41,7 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
+    temperature: float = 1.0,
 ) -> List[List[int]]:
     """
     Generates new tokens based on the given prompt tokens using the specified model.
@@ -48,14 +56,17 @@ def generate(
     Returns:
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
     """
+    device = get_device_initial()
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
-    tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
+    tokens = torch.full(
+        (len(prompt_tokens), total_len), -1, dtype=torch.long, device=device
+    )
     for i, t in enumerate(prompt_tokens):
-        tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        tokens[i, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
     prev_pos = 0
-    finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
+    finished = torch.tensor([False] * len(prompt_tokens), device=device)
     prompt_mask = tokens != -1
     for cur_pos in range(min(prompt_lens), total_len):
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
@@ -63,7 +74,9 @@ def generate(
             next_token = sample(logits, temperature)
         else:
             next_token = logits.argmax(dim=-1)
-        next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+        next_token = torch.where(
+            prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token
+        )
         tokens[:, cur_pos] = next_token
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
@@ -71,9 +84,9 @@ def generate(
             break
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
-        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+        toks = toks[prompt_lens[i] : prompt_lens[i] + max_new_tokens]
         if eos_id in toks:
-            toks = toks[:toks.index(eos_id)]
+            toks = toks[: toks.index(eos_id)]
         completion_tokens.append(toks)
     return completion_tokens
 
@@ -97,6 +110,7 @@ def main(
         max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
     """
+    device = get_device_initial()
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -105,18 +119,45 @@ def main(
     global print
     if rank != 0:
         print = lambda *_, **__: None
-    torch.cuda.set_device(local_rank)
+
+    if device == "cuda":
+        torch.cuda.set_device(local_rank)
+    elif device == "hpu":
+        torch.hpu.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(965)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
-    with torch.device("cuda"):
-        model = Transformer(args)
+
+    if device == "cuda":
+        with torch.device("cuda"):
+            model = Transformer(args)
+    elif device == "hpu":
+        # Adapt the tokenizer to run on Gaudi
+        from optimum.habana.transformers.modeling_utils import (
+            adapt_transformers_to_gaudi,
+        )
+
+        adapt_transformers_to_gaudi()
+
+        with torch.device("hpu"):
+            model = Transformer(args)
+
+            from habana_frameworks.torch.utils.library_loader import load_habana_module
+
+            load_habana_module()
+            if torch.hpu.is_available():
+                from habana_frameworks.torch.hpu import wrap_in_hpu_graph
+
+                model = wrap_in_hpu_graph(model)
+
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
-    tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+    tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.0)[0])
+    load_model(
+        model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
+    )
 
     if interactive:
         messages = []
@@ -137,18 +178,37 @@ def main(
                 messages.clear()
                 continue
             messages.append({"role": "user", "content": prompt})
-            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
-            completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
+            prompt_tokens = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True
+            )
+            completion_tokens = generate(
+                model,
+                [prompt_tokens],
+                max_new_tokens,
+                tokenizer.eos_token_id,
+                temperature,
+            )
+            completion = tokenizer.decode(
+                completion_tokens[0], skip_special_tokens=True
+            )
             print(completion)
             messages.append({"role": "assistant", "content": completion})
     else:
         with open(input_file) as f:
             prompts = [line.strip() for line in f.readlines()]
         assert len(prompts) <= args.max_batch_size
-        prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
-        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
-        completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
+        prompt_tokens = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], add_generation_prompt=True
+            )
+            for prompt in prompts
+        ]
+        completion_tokens = generate(
+            model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature
+        )
+        completions = tokenizer.batch_decode(
+            completion_tokens, skip_special_tokens=True
+        )
         for prompt, completion in zip(prompts, completions):
             print("Prompt:", prompt)
             print("Completion:", completion)
@@ -182,4 +242,11 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     args = parser.parse_args()
     assert args.input_file or args.interactive
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    main(
+        args.ckpt_path,
+        args.config,
+        args.input_file,
+        args.interactive,
+        args.max_new_tokens,
+        args.temperature,
+    )
